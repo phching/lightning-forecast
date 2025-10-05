@@ -1,0 +1,8 @@
+myenv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.tar.gz  
+llis_20250315
