@@ -6,3 +6,6 @@ __pycache__/
 .Python
 *.tar.gz  
 llis_20250315
+
+# TensorBoard logs
+.logs/
