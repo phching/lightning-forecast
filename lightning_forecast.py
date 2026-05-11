@@ -10,7 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from keras.models import Sequential
-from keras.layers import Dense, Dropout, BatchNormalization
+from keras.layers import Dense, Dropout, BatchNormalization, LSTM, Input
 from keras import regularizers
 from keras.optimizers import Adam
 from keras.callbacks import TensorBoard, EarlyStopping, ReduceLROnPlateau
@@ -37,6 +37,7 @@ class Config:
     dropout_rate: float = 0.3
     l2_reg: float = 0.002
     threshold: float = 0.5
+    lstm_units: list = field(default_factory=lambda: [64, 32])
 
 
 config = Config()
@@ -70,74 +71,100 @@ def load_data(folder_path: str):
 
 
 # FEATURE ENGINEERING
-def create_features_and_labels(data: pd.DataFrame, config: Config):
-    features_dict = {window: [] for window in config.time_windows}
-    labels_dict = {window: [] for window in config.time_windows}
-
+def create_sequences(data: pd.DataFrame, config: Config):
+    """
+    For every minute in the data range, extract:
+        a sequence of feature vectors (one per minute) covering the history window
+        a binary label indicating whether a strike occurs in the prediction window
+    """
     time_step = timedelta(minutes=1)
     min_time = data['datetime'].min()
     max_time = data['datetime'].max()
 
-    for window in config.time_windows:
-        current_time = min_time
-        while current_time <= max_time:
-            window_start = current_time - timedelta(minutes=config.history_window_minutes)
+    sequence_features = {window: [] for window in config.time_windows}
+    sequence_labels = {window: [] for window in config.time_windows}
+
+    current_time = min_time 
+
+    while current_time <= max_time:
+        # History window: from (current_time - history window) to current_time
+        history_start = current_time - timedelta(minutes=config.history_window_minutes)
+
+        # For each prediction window 
+        for window in config.time_windows:
             pred_end = current_time + timedelta(minutes=window)
 
-            # Historical window
-            hist_data = data[(data['datetime'] >= window_start) & (data['datetime'] < current_time)]
-            # Prediction window
-            pred_data = data[(data['datetime'] >= current_time) & (data['datetime'] < pred_end)]
+            # Build the sequence: one feature vector for each minute in the history window
+            seq_time = history_start 
+            minute_vectors = []
+            while seq_time < current_time:
+                # Extract strikes that occured in this specific minute
+                minute_data = data[(data['datetime'] >= seq_time) & 
+                                   (data['datetime'] < seq_time + time_step)]
 
-            # Spatial filter (HK)
-            strikes_in_square = hist_data[
-                (config.hk_square['lat_min'] <= hist_data['latitude']) &
-                (hist_data['latitude'] <= config.hk_square['lat_max']) &
-                (config.hk_square['lon_min'] <= hist_data['longitude']) &
-                (hist_data['longitude'] <= config.hk_square['lon_max'])
+                # Spatial filter (HK)
+                strikes_in_square = minute_data[
+                    (config.hk_square['lat_min'] <= minute_data['latitude']) &
+                    (minute_data['latitude'] <= config.hk_square['lat_max']) &
+                    (config.hk_square['lon_min'] <= minute_data['longitude']) &
+                    (minute_data['longitude'] <= config.hk_square['lon_max'])
+                ]
+
+                feature_dict = {
+                    'strike_count': len(strikes_in_square),
+                    'avg_peak_current': strikes_in_square['peak_current'].abs().mean() if len(strikes_in_square) > 0 else 0,
+                    'max_peak_current': strikes_in_square['peak_current'].abs().max() if len(strikes_in_square) > 0 else 0,
+                    'std_peak_current': strikes_in_square['peak_current'].abs().std() if len(strikes_in_square) > 1 else 0,
+                    'avg_num_sensors': strikes_in_square['number_of_sensors'].mean() if len(strikes_in_square) > 0 else 2,
+                    'avg_chi_square': strikes_in_square['chi_square'].mean() if len(strikes_in_square) > 0 else 0,
+                    'hour': current_time.hour,
+                    'day_of_week': current_time.weekday(),
+                    'is_weekend': 1 if current_time.weekday() >= 5 else 0,
+                }
+                minute_vectors.append(list(feature_dict.values()))
+                seq_time += time_step
+            
+            # Sequence for this window : (history_indow_minutes, n_features)
+            sequence_features[window].append(minute_vectors)
+            
+            # Label : 1 if any strike in prediction window inside HK box
+            pred_strikes = data[(data['datetime'] >= current_time) & (data['datetime'] <pred_end)]
+            pred_strikes_hk = pred_strikes [
+                (config.hk_square['lat_min'] <= pred_strikes['latitude']) &
+                (pred_strikes['latitude'] <= config.hk_square['lat_max']) &
+                (config.hk_square['lon_min'] <= pred_strikes['longitude']) &
+                (pred_strikes['longitude'] <= config.hk_square['lon_max'])
             ]
+            label = 1 if len(pred_strikes_hk) > 0 else 0
+            sequence_labels[window].append(label)
 
-            feature_dict = {
-                'strike_count': len(strikes_in_square),
-                'avg_peak_current': strikes_in_square['peak_current'].abs().mean() if len(strikes_in_square) > 0 else 0,
-                'max_peak_current': strikes_in_square['peak_current'].abs().max() if len(strikes_in_square) > 0 else 0,
-                'std_peak_current': strikes_in_square['peak_current'].abs().std() if len(strikes_in_square) > 1 else 0,
-                'avg_num_sensors': strikes_in_square['number_of_sensors'].mean() if len(strikes_in_square) > 0 else 2,
-                'avg_chi_square': strikes_in_square['chi_square'].mean() if len(strikes_in_square) > 0 else 0,
-                'hour': current_time.hour,
-                'day_of_week': current_time.weekday(),
-                'is_weekend': 1 if current_time.weekday() >= 5 else 0,
-            }
+        current_time += time_step
 
-            # Label
-            pred_strikes = pred_data[
-                (config.hk_square['lat_min'] <= pred_data['latitude']) &
-                (pred_data['latitude'] <= config.hk_square['lat_max']) &
-                (config.hk_square['lon_min'] <= pred_data['longitude']) &
-                (pred_data['longitude'] <= config.hk_square['lon_max'])
-            ]
-            label = 1 if len(pred_strikes) > 0 else 0
-
-            features_dict[window].append(list(feature_dict.values()))
-            labels_dict[window].append(label)
-
-            current_time += time_step
-
-    return features_dict, labels_dict
+    return sequence_features, sequence_labels
 
 
 # MODEL BUILDING
-def build_model(input_dim: int, config: Config):
+def build_model(input_shape, config: Config):
+    """
+    Build a two-layer LSTM model
+    input_shape: (time_steps, n_features)
+    """
     model = Sequential([
-        Dense(128, activation='relu', kernel_regularizer=regularizers.l2(config.l2_reg), input_shape=(input_dim,)),
+        Input(shape=input_shape),
+        LSTM(config.lstm_units[0], return_sequences=True,
+             kernel_regularizer=regularizers.l2(config.l2_reg),
+             recurrent_regularizer=regularizers.l2(config.l2_reg)),
         BatchNormalization(),
         Dropout(config.dropout_rate),
 
-        Dense(64, activation='relu', kernel_regularizer=regularizers.l2(config.l2_reg)),
+        LSTM(config.lstm_units[1], return_sequences=False,
+             kernel_regularizer=regularizers.l2(config.l2_reg),
+             recurrent_regularizer=regularizers.l2(config.l2_reg)),
         BatchNormalization(),
         Dropout(config.dropout_rate),
 
-        Dense(32, activation='relu'),
+        Dense(16, activation='relu'),
+        Dropout(0.2),
         Dense(1, activation='sigmoid')
     ])
 
@@ -154,7 +181,7 @@ def main():
     print("Starting Lightning Strike Forecaster for Hong Kong...\n")
 
     data = load_data(config.data_folder)
-    features_dict, labels_dict = create_features_and_labels(data, config)
+    features_sequences, labels_sequences = create_sequences(data, config)
 
     models = {}
     results = []
@@ -167,8 +194,8 @@ def main():
         print(f"Training model for {window}-minute prediction window")
         print(f"{'='*60}")
 
-        X = np.array(features_dict[window])
-        y = np.array(labels_dict[window])
+        X = np.array(features_sequences[window]) # shape: (n_samples, history_window_minutes, n_features)
+        y = np.array(labels_sequences[window])
 
         print(f"Dataset shape: {X.shape} | Positive samples: {y.sum()}/{len(y)} ({y.mean():.2%})")
 
@@ -177,10 +204,17 @@ def main():
             X, y, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Scaling
+        # Scale features  (flatten -> scales -> reshape)
+        n_samples, n_steps, n_features = X_train.shape
+        X_train_flat = X_train.reshape(-1, n_features)
+        X_test_flat = X_test.reshape(-1, n_features)
+
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
+        X_train_scaled_flat = scaler.fit_transform(X_train_flat)
+        X_test_scaled_flat = scaler.transform(X_test_flat)
+
+        X_train_scaled = X_train_scaled_flat.reshape(n_samples, n_steps, n_features)
+        X_test_scaled = X_test_scaled_flat.reshape(X_test.shape[0], n_steps, n_features)
 
         # Save scaler
         scaler_path = model_dir / f"scaler_{window}min.pkl"
@@ -188,7 +222,7 @@ def main():
             pickle.dump(scaler, f)
 
         # Build & train model
-        model = build_model(X_train.shape[1], config)
+        model = build_model((X.shape[1], X.shape[2]), config)
 
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=config.early_stopping_patience,
@@ -207,7 +241,7 @@ def main():
             validation_data=(X_test_scaled, y_test),
             class_weight=class_weight_dict,
             callbacks=callbacks,
-            verbose=1
+            verbose="auto"
         )
 
         # Evaluation
