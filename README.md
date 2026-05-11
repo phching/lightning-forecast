@@ -1,6 +1,6 @@
 # Lightning Strike Forecaster — Hong Kong
 
-A machine learning pipeline that predicts **cloud-to-ground lightning strikes** over Hong Kong up to 5 minutes in advance, using historical LLIS sensor data and a Multi-Layer Perceptron (MLP) neural network.
+A machine learning pipeline that predicts **cloud-to-ground lightning strikes** over Hong Kong up to 5 minutes in advance, using historical LLIS sensor data and an LSTM neural network.
 
 ---
 
@@ -23,7 +23,8 @@ A machine learning pipeline that predicts **cloud-to-ground lightning strikes** 
 
 ## Overview
 
-This project trains a separate binary classifier for each of five prediction windows (1, 2, 3, 4, and 5 minutes). Given a 10-minute history of lightning activity within a bounding box covering Hong Kong, each model predicts whether a cloud-to-ground strike will occur in the next N minutes.
+This project trains a separate binary classifier for each of five prediction windows (1, 2, 3, 4, and 5 minutes). Given a 10-minute history of lightning activity(one feature vector per minutes) within a bounding box covering Hong Kong, the LSTM model predicts whether a cloud-to-ground strike will occur in the next N minutes.
+The use of LSTM allowss the model to capture temporal patterns in lightning activity over the history window.
 
 | Prediction Window | Task |
 |---|---|
@@ -37,9 +38,10 @@ This project trains a separate binary classifier for each of five prediction win
 
 - Loads and parses raw LLIS (Lightning Location and Information System) data files
 - Filters for cloud-to-ground strikes only (`cloud_indicator = 0`)
-- Sliding time-window feature extraction with spatial filtering to the HK bounding box
+- Creates temporal seuences with 1-minute resolution over a 10-minute history window
+- Spatial filtering to the Hong Kong bounding box
 - Handles severe class imbalance via computed class weights
-- MLP with BatchNormalization, Dropout, and L2 regularisation
+- LSTM architecture with BatchNormalization, Dropout, and L2 regularisation
 - Early stopping and learning rate scheduling via callbacks
 - Saves both the trained model (`.keras`) and fitted scaler (`.pkl`) per window
 - Prints a final side-by-side comparison table across all five windows
@@ -56,7 +58,7 @@ This project trains a separate binary classifier for each of five prediction win
 │   ├── scaler_1min.pkl
 │   └── ...
 ├── .logs/fit/                   # TensorBoard logs (auto-created)
-├── lightning_forecast_improved.py
+├── lightning_forecast.py
 └── README.md
 ```
 
@@ -95,7 +97,7 @@ pip install tensorflow scikit-learn pandas numpy
 2. Run the pipeline:
 
 ```bash
-python lightning_forecast.py
+uv run lightning_forecast.py
 ```
 
 3. Monitor training in TensorBoard (optional):
@@ -117,10 +119,13 @@ model  = keras.models.load_model("model/lightning_model_3min.keras")
 with open("model/scaler_3min.pkl", "rb") as f:
     scaler = pickle.load(f)
 
+# Example : 10 minutes of history x 9 features
 # features: [strike_count, avg_peak_current, max_peak_current, std_peak_current,
 #            avg_num_sensors, avg_chi_square, hour, day_of_week, is_weekend]
-features = np.array([[5, 12.3, 28.1, 4.2, 6.0, 0.8, 14, 2, 0]])
-prob = model.predict(scaler.transform(features))[0][0]
+history_sequence = np.random.rand(10, 9).astype(np.float32) # replace with real data
+history_scaled = scaler.transform(history_sequence.reshape(-1,9)).reshape(1,10,9)
+
+prob = model.predict(history_scaled, verbose=0)[0][0]
 print(f"Probability of strike in next 3 minutes: {prob:.2%}")
 ```
 
@@ -135,7 +140,7 @@ Raw LLIS files
  Load & filter           cloud_indicator = 0 (CG strikes only)
       │
       ▼
- Feature extraction      10-min look-back · 1-min time step · HK bounding box
+ Sequence extraction      10-min history (1 vector per minute)
       │
       ▼
  Labelling               Did any CG strike occur in the next N minutes?
@@ -147,7 +152,7 @@ Raw LLIS files
  StandardScaler          Fitted on train set only — applied to test set
       │
       ▼
- MLP training            Class weights · EarlyStopping · ReduceLROnPlateau
+LSTM training            Class weights · EarlyStopping · ReduceLROnPlateau
       │
       ▼
  Evaluation              Precision · Recall · F1 · ROC-AUC · confusion matrix
@@ -184,13 +189,13 @@ Raw LLIS files
 ## Model Architecture
 
 ```
-Input (9 features)
+Input (shape(10, 9)) # time steps x features
     │
-    Dense(128) + BatchNormalization + ReLU + Dropout(0.3)
+    LSTM(64, return_sequences=True) + BatchNormalization + Dropout(0.3)
     │
-    Dense(64)  + BatchNormalization + ReLU + Dropout(0.3)
+    LSTM(32, return_sequences=False)  + BatchNormalization  + Dropout(0.3)
     │
-    Dense(32)  + ReLU
+    Dense(16)  + ReLU + Dropout(0.2)
     │
     Dense(1)   + Sigmoid
     │
